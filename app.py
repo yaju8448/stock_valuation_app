@@ -1,3 +1,22 @@
+import yfinance as yf
+import requests
+
+# Add this custom session helper
+def get_yf_session():
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    })
+    return session
+
+# Inside fetch_stock_data:
+def fetch_stock_data(ticker_symbol: str):
+    symbol = ticker_symbol.strip().upper()
+    session = get_yf_session()
+    stock = yf.Ticker(symbol, session=session)
+    
+    info = stock.info
+    # ... rest of your code ...
 import io
 import os
 import requests
