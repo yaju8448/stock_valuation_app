@@ -1,22 +1,3 @@
-import yfinance as yf
-import requests
-
-# Add this custom session helper
-def get_yf_session():
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    })
-    return session
-
-# Inside fetch_stock_data:
-def fetch_stock_data(ticker_symbol: str):
-    symbol = ticker_symbol.strip().upper()
-    session = get_yf_session()
-    stock = yf.Ticker(symbol, session=session)
-    
-    info = stock.info
-    # ... rest of your code ...
 import io
 import os
 import requests
@@ -32,9 +13,18 @@ st.set_page_config(
     layout="wide"
 )
 
-# -------------------------------------------------------------
-# 1. Scraping & Data Fetching Functions
-# -------------------------------------------------------------
+# Custom HTTP session with realistic browser headers to avoid 401/429 Cloud blocks
+def get_session():
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        )
+    })
+    return session
+
+
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_from_screener(ticker_symbol: str):
     """Directly scrapes Screener.in quarterly results table for Indian stocks."""
@@ -99,108 +89,133 @@ def fetch_from_screener(ticker_symbol: str):
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_stock_data(ticker_symbol: str):
-    """Fetch financial data for DCF, Graham models and quarterly tables."""
     symbol = ticker_symbol.strip().upper()
-    stock = yf.Ticker(symbol)
-    info = stock.info
+    session = get_session()
+    stock = yf.Ticker(symbol, session=session)
 
-    # Price Check
-    current_price = info.get("currentPrice") or info.get("regularMarketPrice")
-    if not current_price:
-        # Auto-retry with .NS if not provided
-        if "." not in symbol:
-            symbol = f"{symbol}.NS"
-            stock = yf.Ticker(symbol)
-            info = stock.info
+    # 1. Fetch current price via fast_info to bypass cloud bot blocking
+    current_price = None
+    try:
+        fast = stock.fast_info
+        current_price = fast.get("lastPrice") or fast.get("regularMarketPreviousClose")
+    except Exception:
+        pass
+
+    # 2. NSE retry if ticker was entered without extension
+    if not current_price and "." not in symbol:
+        symbol = f"{symbol}.NS"
+        stock = yf.Ticker(symbol, session=session)
+        try:
+            fast = stock.fast_info
+            current_price = fast.get("lastPrice") or fast.get("regularMarketPreviousClose")
+        except Exception:
+            pass
+
+    # 3. Fallback to full info dictionary
+    info = {}
+    try:
+        info = stock.info or {}
+        if not current_price:
             current_price = info.get("currentPrice") or info.get("regularMarketPrice")
+    except Exception:
+        pass
 
     if not current_price:
-        raise ValueError(f"Could not retrieve stock price for {ticker_symbol}. Check ticker symbol.")
+        raise ValueError(
+            f"Could not retrieve stock data for '{ticker_symbol}'. "
+            f"Ensure the stock is publicly listed on NSE/BSE/US exchanges and the ticker symbol is correct."
+        )
 
     company_name = info.get("shortName", symbol)
-    currency = info.get("currency", "USD")
-    shares_outstanding = info.get("sharesOutstanding") or 0
+    currency = getattr(stock.fast_info, "currency", None) or info.get("currency", "INR" if symbol.endswith(".NS") else "USD")
+    shares_outstanding = getattr(stock.fast_info, "shares", None) or info.get("sharesOutstanding") or 0
 
     eps_trailing = info.get("trailingEps", 0.0) or 0.0
     book_value_per_share = info.get("bookValue", 0.0) or 0.0
 
     # Free Cash Flow calculation
-    cf = stock.cashflow
     fcf = 0.0
-    if cf is not None and not cf.empty:
-        if "Free Cash Flow" in cf.index:
-            fcf = cf.loc["Free Cash Flow"].iloc[0]
-        elif "Operating Cash Flow" in cf.index and "Capital Expenditure" in cf.index:
-            fcf = cf.loc["Operating Cash Flow"].iloc[0] + cf.loc["Capital Expenditure"].iloc[0]
-        elif "Total Cash From Operating Activities" in cf.index and "Capital Expenditures" in cf.index:
-            fcf = cf.loc["Total Cash From Operating Activities"].iloc[0] + cf.loc["Capital Expenditures"].iloc[0]
+    try:
+        cf = stock.cashflow
+        if cf is not None and not cf.empty:
+            if "Free Cash Flow" in cf.index:
+                fcf = cf.loc["Free Cash Flow"].iloc[0]
+            elif "Operating Cash Flow" in cf.index and "Capital Expenditure" in cf.index:
+                fcf = cf.loc["Operating Cash Flow"].iloc[0] + cf.loc["Capital Expenditure"].iloc[0]
+            elif "Total Cash From Operating Activities" in cf.index and "Capital Expenditures" in cf.index:
+                fcf = cf.loc["Total Cash From Operating Activities"].iloc[0] + cf.loc["Capital Expenditures"].iloc[0]
+    except Exception:
+        pass
 
     growth_rate = info.get("earningsGrowth", 0.08) if info.get("earningsGrowth") is not None else 0.08
-    growth_rate = max(0.03, min(growth_rate, 0.25))
+    growth_rate = max(0.03, min(float(growth_rate), 0.25))
 
-    is_inr = currency.upper() == "INR"
+    is_inr = str(currency).upper() == "INR"
     scale_factor = 10_000_000.0 if is_inr else 1_000_000.0
     unit_label = "₹ Cr" if is_inr else f"{currency} M"
 
-    # Step 1: Check Screener for Indian stocks
     quarterly_df = pd.DataFrame()
     data_source = "Yahoo Finance"
 
+    # Step 1: Use Screener.in for Indian tickers
     if is_inr:
         screener_df = fetch_from_screener(symbol)
         if screener_df is not None and not screener_df.empty:
             quarterly_df = screener_df
             data_source = "Screener.in (Verified)"
 
-    # Step 2: Fallback to Yahoo Finance quarterly tables
+    # Step 2: Fallback to Yahoo Finance statements
     if quarterly_df.empty:
-        q_income = stock.quarterly_income_stmt
-        if q_income is None or q_income.empty:
-            q_income = stock.quarterly_financials
-        q_cf = stock.quarterly_cashflow
+        try:
+            q_income = stock.quarterly_income_stmt
+            if q_income is None or q_income.empty:
+                q_income = stock.quarterly_financials
+            q_cf = stock.quarterly_cashflow
 
-        available_dates = set()
-        if q_income is not None and not q_income.empty:
-            available_dates.update(q_income.columns)
-        if q_cf is not None and not q_cf.empty:
-            available_dates.update(q_cf.columns)
+            available_dates = set()
+            if q_income is not None and not q_income.empty:
+                available_dates.update(q_income.columns)
+            if q_cf is not None and not q_cf.empty:
+                available_dates.update(q_cf.columns)
 
-        sorted_dates = sorted(list(available_dates), key=lambda d: pd.to_datetime(d), reverse=True)
-        quarterly_records = []
+            sorted_dates = sorted(list(available_dates), key=lambda d: pd.to_datetime(d), reverse=True)
+            quarterly_records = []
 
-        for col_date in sorted_dates:
-            date_str = pd.to_datetime(col_date).strftime("%Y-%m-%d")
-            rev, op_inc, net_inc, ocf_q = 0.0, 0.0, 0.0, 0.0
+            for col_date in sorted_dates:
+                date_str = pd.to_datetime(col_date).strftime("%Y-%m-%d")
+                rev, op_inc, net_inc, ocf_q = 0.0, 0.0, 0.0, 0.0
 
-            if q_income is not None and not q_income.empty and col_date in q_income.columns:
-                for l in ["Total Revenue", "Operating Revenue", "Revenue"]:
-                    if l in q_income.index:
-                        rev = q_income.loc[l, col_date]
-                        break
-                for l in ["Operating Income", "Operating Profit", "EBIT"]:
-                    if l in q_income.index:
-                        op_inc = q_income.loc[l, col_date]
-                        break
-                for l in ["Net Income", "Net Income Common Stockholders"]:
-                    if l in q_income.index:
-                        net_inc = q_income.loc[l, col_date]
-                        break
+                if q_income is not None and not q_income.empty and col_date in q_income.columns:
+                    for l in ["Total Revenue", "Operating Revenue", "Revenue"]:
+                        if l in q_income.index:
+                            rev = q_income.loc[l, col_date]
+                            break
+                    for l in ["Operating Income", "Operating Profit", "EBIT"]:
+                        if l in q_income.index:
+                            op_inc = q_income.loc[l, col_date]
+                            break
+                    for l in ["Net Income", "Net Income Common Stockholders"]:
+                        if l in q_income.index:
+                            net_inc = q_income.loc[l, col_date]
+                            break
 
-            if q_cf is not None and not q_cf.empty and col_date in q_cf.columns:
-                for l in ["Operating Cash Flow", "Total Cash From Operating Activities"]:
-                    if l in q_cf.index:
-                        ocf_q = q_cf.loc[l, col_date]
-                        break
+                if q_cf is not None and not q_cf.empty and col_date in q_cf.columns:
+                    for l in ["Operating Cash Flow", "Total Cash From Operating Activities"]:
+                        if l in q_cf.index:
+                            ocf_q = q_cf.loc[l, col_date]
+                            break
 
-            quarterly_records.append({
-                "Quarter Ended": date_str,
-                f"Revenue ({unit_label})": round(float(rev) / scale_factor, 2),
-                f"Operating Income ({unit_label})": round(float(op_inc) / scale_factor, 2),
-                f"Net Income ({unit_label})": round(float(net_inc) / scale_factor, 2),
-                f"Operating CF ({unit_label})": round(float(ocf_q) / scale_factor, 2),
-            })
+                quarterly_records.append({
+                    "Quarter Ended": date_str,
+                    f"Revenue ({unit_label})": round(float(rev) / scale_factor, 2),
+                    f"Operating Income ({unit_label})": round(float(op_inc) / scale_factor, 2),
+                    f"Net Income ({unit_label})": round(float(net_inc) / scale_factor, 2),
+                    f"Operating CF ({unit_label})": round(float(ocf_q) / scale_factor, 2),
+                })
 
-        quarterly_df = pd.DataFrame(quarterly_records) if quarterly_records else pd.DataFrame()
+            quarterly_df = pd.DataFrame(quarterly_records) if quarterly_records else pd.DataFrame()
+        except Exception:
+            quarterly_df = pd.DataFrame()
 
     return {
         "ticker": symbol,
@@ -219,9 +234,7 @@ def fetch_stock_data(ticker_symbol: str):
         "unit_label": unit_label,
     }
 
-# -------------------------------------------------------------
-# 2. Valuation Algorithms
-# -------------------------------------------------------------
+
 def calculate_dcf(fcf: float, shares: int, growth_rate: float, discount_rate: float = 0.09, terminal_growth: float = 0.025, projection_years: int = 5):
     if not fcf or fcf <= 0 or not shares or shares <= 0:
         return 0.0, []
@@ -291,17 +304,15 @@ def generate_excel_bytes(data, dcf_val, graham_rev, graham_num, combined_val, up
     output.seek(0)
     return output
 
-# -------------------------------------------------------------
-# 3. Streamlit Frontend Layout
-# -------------------------------------------------------------
-st.title("📊 DCF & Graham Valuation Dashboard")
-st.caption("Perform intrinsic valuation using Discounted Cash Flow and Benjamin Graham formulas locally.")
 
-# Sidebar Configuration
+# ---------------- UI Layout ----------------
+st.title("📊 DCF & Graham Valuation Dashboard")
+st.caption("Perform intrinsic valuation using Discounted Cash Flow and Benjamin Graham formulas.")
+
 with st.sidebar:
     st.header("⚙️ Valuation Parameters")
-    ticker_input = st.text_input("Enter Stock Ticker:", value="RELIANCE", help="e.g. RELIANCE, TCS.NS, AAPL, MSFT")
-    
+    ticker_input = st.text_input("Enter Stock Ticker:", value="RELIANCE", help="e.g. RELIANCE, TCS, INFY, AAPL, MSFT")
+
     st.subheader("Model Overrides")
     override_growth = st.checkbox("Custom Growth Rate")
     custom_growth = st.slider("5Y Growth Rate (%)", min_value=1.0, max_value=40.0, value=10.0, step=0.5) if override_growth else None
@@ -320,10 +331,8 @@ if ticker_input:
             st.error(f"Error fetching data: {e}")
             st.stop()
 
-    # Apply growth rate
     assumed_growth = (custom_growth / 100.0) if override_growth and custom_growth else data["estimated_growth"]
 
-    # Calculate Values
     dcf_value, dcf_table = calculate_dcf(
         fcf=data["fcf"],
         shares=data["shares_outstanding"],
@@ -355,11 +364,9 @@ if ticker_input:
         verdict = "Fairly Valued"
         badge_color = "orange"
 
-    # Header Card
     st.subheader(f"{data['name']} ({data['ticker']})")
     st.markdown(f"**Data Source:** `{data['data_source']}` | **Currency:** `{data['currency']}`")
 
-    # Key Metrics Cards
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Current Market Price", f"{data['currency']} {curr_p:,.2f}")
     col2.metric("Blended Intrinsic Value", f"{data['currency']} {blended_val:,.2f}" if blended_val > 0 else "N/A")
@@ -368,7 +375,6 @@ if ticker_input:
 
     st.markdown("---")
 
-    # Valuation Comparison Tab
     tab1, tab2, tab3 = st.tabs(["💡 Valuation Breakdown", "📈 5-Year DCF Projections", "📋 Quarterly Financials"])
 
     with tab1:
@@ -394,7 +400,6 @@ if ticker_input:
             st.write(f"- Base Free Cash Flow: **{data['currency']} {fcf_scaled:,.2f} {data['unit_label']}**")
 
         with c2:
-            # Bar Chart Comparison
             fig = go.Figure(data=[
                 go.Bar(
                     name="Valuation Models",
@@ -419,7 +424,6 @@ if ticker_input:
         else:
             st.info("No quarterly statements found.")
 
-    # Excel Export
     excel_file = generate_excel_bytes(
         data=data,
         dcf_val=dcf_value,
